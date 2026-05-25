@@ -43,7 +43,7 @@
 ## 前提条件
 
 - **Linux** でKVMが有効であること（`/dev/kvm`が存在）、**または** Apple Silicon搭載のmacOS
-- Go 1.24+
+- Go 1.25+
 - `msb` ランタイムと `libkrunfw` は初回起動時に `microsandbox.EnsureInstalled()` で自動ダウンロードされます
 
 ## クイックスタート
@@ -163,12 +163,12 @@ go build -o shoes-microsandbox .
 ## Docker
 
 ```dockerfile
-FROM golang:1.24 AS builder
+FROM golang:1.25 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o shoes-microsandbox .
+RUN go build -o shoes-microsandbox .
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*

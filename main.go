@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 
 	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
 	"github.com/hashicorp/go-plugin"
@@ -16,23 +18,22 @@ import (
 
 // Environment variable keys for configuration
 const (
-	EnvMSBImage              = "MSB_IMAGE"              // OCI image for runners (default: "ubuntu")
-	EnvMSBMemoryMiB          = "MSB_MEMORY_MIB"          // Memory per sandbox in MiB (default: 2048)
-	EnvMSBCPUs               = "MSB_CPUS"               // Number of CPUs per sandbox (default: 2)
-	EnvMSBRunnerUser         = "MSB_RUNNER_USER"         // User inside VM (default: "runner")
-	EnvMSBResourceType       = "MSB_RESOURCE_TYPE"       // Default resource type mapping
-	EnvMSBHomeDir            = "MSB_HOME_DIR"            // Base directory for msb state (default: "~/.microsandbox")
-	EnvMSBRegistryUsername   = "MSB_REGISTRY_USERNAME"   // Private registry username
-	EnvMSBRegistryPassword   = "MSB_REGISTRY_PASSWORD"   // Private registry password
-	EnvMSBPullPolicy         = "MSB_PULL_POLICY"         // Image pull policy: "always", "if-missing", "never" (default: "" = if-missing)
+	EnvMSBImage            = "MSB_IMAGE"            // OCI image for runners
+	EnvMSBMemoryMiB        = "MSB_MEMORY_MIB"        // Memory per sandbox in MiB
+	EnvMSBCPUs             = "MSB_CPUS"              // Number of CPUs per sandbox
+	EnvMSBRunnerUser       = "MSB_RUNNER_USER"      // User inside VM
+	EnvMSBRegistryUsername = "MSB_REGISTRY_USERNAME" // Private registry username
+	EnvMSBRegistryPassword = "MSB_REGISTRY_PASSWORD" // Private registry password
+	EnvMSBPullPolicy       = "MSB_PULL_POLICY"       // Image pull policy: "always", "if-missing", "never"
 )
 
 // Default configuration values
 const (
-	DefaultImage       = "ghcr.io/actions/actions-runner:latest"
-	DefaultMemoryMiB   = 2048
-	DefaultCPUs        = 2
-	DefaultRunnerUser  = "runner"
+	DefaultImage      = "ghcr.io/actions/actions-runner:latest"
+	DefaultMemoryMiB  = 2048
+	DefaultCPUs       = 2
+	DefaultRunnerUser = "runner"
+	ShoesType         = "shoes-microsandbox"
 )
 
 func main() {
@@ -88,8 +89,14 @@ type MicrosandboxServer struct {
 // NewMicrosandboxServer creates a new MicrosandboxServer from environment config
 func NewMicrosandboxServer() (*MicrosandboxServer, error) {
 	image := envOrDefault(EnvMSBImage, DefaultImage)
-	memoryMiB := envOrDefaultInt(EnvMSBMemoryMiB, DefaultMemoryMiB)
-	cpus := envOrDefaultInt(EnvMSBCPUs, DefaultCPUs)
+	memoryMiB, err := envOrDefaultInt(EnvMSBMemoryMiB, DefaultMemoryMiB)
+	if err != nil {
+		slog.Warn("using default for memory", "error", err)
+	}
+	cpus, err := envOrDefaultInt(EnvMSBCPUs, DefaultCPUs)
+	if err != nil {
+		slog.Warn("using default for cpus", "error", err)
+	}
 	runnerUser := envOrDefault(EnvMSBRunnerUser, DefaultRunnerUser)
 
 	// Optional: private registry credentials
@@ -144,7 +151,8 @@ func (s *MicrosandboxServer) AddInstance(ctx context.Context, req *pb.AddInstanc
 		microsandbox.WithMemory(memoryMiB),
 		microsandbox.WithCPUs(cpus),
 		microsandbox.WithHostname(sandboxName),
-		microsandbox.WithReplace(), // Replace if a sandbox with this name already exists
+		microsandbox.WithDetached(), // VM outlives this process — required for long-running runners
+		microsandbox.WithReplace(),  // Replace if a sandbox with this name already exists
 	}
 
 	// Apply registry credentials if configured
@@ -188,11 +196,13 @@ func (s *MicrosandboxServer) AddInstance(ctx context.Context, req *pb.AddInstanc
 			logger.Error("setup script exited non-zero",
 				"runner_name", req.RunnerName,
 				"exit_code", output.ExitCode(),
-				"stdout", output.Stdout(),
-				"stderr", output.Stderr(),
 			)
-			// Don't fail here — the runner might still register
-			// Log the error but continue
+			// Clean up the sandbox on setup script failure
+			if _, stopErr := sb.StopAndWait(ctx); stopErr != nil {
+				logger.Warn("failed to stop sandbox after setup script failure",
+					"error", stopErr)
+			}
+			return nil, status.Errorf(codes.Internal, "setup script exited with code %d", output.ExitCode())
 		}
 	}
 
@@ -217,8 +227,6 @@ func (s *MicrosandboxServer) AddInstance(ctx context.Context, req *pb.AddInstanc
 	}
 
 	cloudID := sandboxName
-	shoesType := "shoes-microsandbox"
-	resourceType := resourceTypeToPb(req.ResourceType)
 
 	logger.Info("sandbox created successfully",
 		"runner_name", req.RunnerName,
@@ -228,9 +236,9 @@ func (s *MicrosandboxServer) AddInstance(ctx context.Context, req *pb.AddInstanc
 
 	return &pb.AddInstanceResponse{
 		CloudId:      cloudID,
-		ShoesType:    shoesType,
+		ShoesType:    ShoesType,
 		IpAddress:    ipAddress,
-		ResourceType: resourceType,
+		ResourceType: resourceTypeToPb(req.ResourceType),
 	}, nil
 }
 
@@ -241,15 +249,26 @@ func (s *MicrosandboxServer) DeleteInstance(ctx context.Context, req *pb.DeleteI
 		"cloud_id", req.CloudId,
 	)
 
+	// Validate that cloudID has the expected prefix to prevent targeting arbitrary sandboxes
+	if !strings.HasPrefix(req.CloudId, "myshoes-") {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid cloud_id: must start with 'myshoes-', got %q", req.CloudId)
+	}
+
 	// Look up the sandbox by name (cloudID == sandbox name)
 	handle, err := microsandbox.GetSandbox(ctx, req.CloudId)
 	if err != nil {
+		if microsandbox.IsKind(err, microsandbox.ErrSandboxNotFound) {
+			// Sandbox already gone — treat as success
+			logger.Info("sandbox already removed",
+				"cloud_id", req.CloudId,
+			)
+			return &pb.DeleteInstanceResponse{}, nil
+		}
 		logger.Error("failed to find sandbox",
 			"cloud_id", req.CloudId,
 			"error", err,
 		)
-		// If sandbox is not found, it may have already been cleaned up — treat as success
-		return &pb.DeleteInstanceResponse{}, nil
+		return nil, status.Errorf(codes.Internal, "failed to find sandbox: %v", err)
 	}
 
 	// Stop the sandbox
@@ -312,23 +331,25 @@ func (s *MicrosandboxServer) resourceConfig(rt pb.ResourceType) (uint32, uint8) 
 
 // getSandboxIP attempts to determine the sandbox's IP address
 func (s *MicrosandboxServer) getSandboxIP(ctx context.Context, sb *microsandbox.Sandbox) (string, error) {
-	// Try to get the IP from the sandbox by running `hostname -I` or `ip addr`
+	// Try to get the IP from the sandbox by running `hostname -I`
 	output, err := sb.Exec(ctx, "/bin/sh", []string{"-c", "hostname -I 2>/dev/null | awk '{print $1}'"})
 	if err != nil {
 		return "", fmt.Errorf("failed to get IP: %w", err)
 	}
-	ip := output.Stdout()
-	if ip != "" {
+	if ip := strings.TrimSpace(output.Stdout()); ip != "" {
 		return ip, nil
 	}
 
-	// Fallback: try `ip addr`
+	// Fallback: try `ip addr` (POSIX-compatible — no grep -P)
 	output, err = sb.Exec(ctx, "/bin/sh", []string{"-c",
-		"ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'"})
+		"ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1"})
 	if err != nil {
 		return "", fmt.Errorf("failed to get IP via ip addr: %w", err)
 	}
-	return output.Stdout(), nil
+	if ip := strings.TrimSpace(output.Stdout()); ip != "" {
+		return ip, nil
+	}
+	return "", fmt.Errorf("could not determine sandbox IP address")
 }
 
 // resourceTypeToPb converts the proto resource type, defaulting to the configured type
@@ -347,18 +368,21 @@ func envOrDefault(key, defaultVal string) string {
 	return defaultVal
 }
 
-// envOrDefaultInt reads an environment variable as int or returns the default value
-func envOrDefaultInt(key string, defaultVal int) int {
+// envOrDefaultInt reads an environment variable as a positive int or returns the default value.
+// Returns an error if the value is non-numeric, negative, or zero.
+func envOrDefaultInt(key string, defaultVal int) (int, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		return defaultVal
+		return defaultVal, nil
 	}
-	intVal := 0
-	_, err := fmt.Sscanf(v, "%d", &intVal)
+	intVal, err := strconv.Atoi(v)
 	if err != nil {
-		return defaultVal
+		return defaultVal, fmt.Errorf("invalid integer value for %s: %q, using default %d: %w", key, v, defaultVal, err)
 	}
-	return intVal
+	if intVal <= 0 {
+		return defaultVal, fmt.Errorf("value for %s must be positive, got %d, using default %d", key, intVal, defaultVal)
+	}
+	return intVal, nil
 }
 
 // Ensure MicrosandboxServer implements the ShoesServer interface at compile time
