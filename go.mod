@@ -1,6 +1,6 @@
 module github.com/whywaita/shoes-microsandbox
 
-go 1.25.0
+go 1.27.3
 
 require (
 	github.com/hashicorp/go-plugin v1.7.0
